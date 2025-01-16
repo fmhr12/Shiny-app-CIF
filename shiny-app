@@ -1,0 +1,261 @@
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+
+
+library(shiny)
+library(shinythemes)
+library(survival)
+library(riskRegression)
+library(dplyr)
+library(fastshap)
+library(shapviz)
+library(ggplot2)
+library(readxl)
+library(prodlim)
+library(cluster)  # For gower distance (daisy)
+library(plotly)   # For interactive plots
+
+# -----------------------
+# Function to compute Gower distance from a single row to each row of a DF
+# -----------------------
+compute_gower_distances <- function(single_row, df_full) {
+  tmp <- rbind(single_row, df_full)
+  dist_mat <- daisy(tmp, metric = "gower") 
+  full_matrix <- as.matrix(dist_mat)
+  d_to_others <- full_matrix[1, 2:nrow(tmp)]
+  return(d_to_others)
+}
+
+# -----------------------
+# 1. Load Final Model
+# -----------------------
+# Define file paths as variables
+saved_model_path <- "final_fg_model.rds"
+precomputed_path <- "precomputed_shap_grid_multi_times2.rds"
+mean_cif_path <- "mean_cif_data.rds"
+
+# Load the RDS files using the variables
+final_model <- readRDS(saved_model_path)
+final_grid_data <- readRDS(precomputed_path)
+mean_cif_data <- readRDS(mean_cif_path)  
+
+feature_cols <- c("Insurance_Type", "Node", "Periodontal_Grading",
+                  "Disease_Site_Merged_2", "Age", 
+                  "Smoking_Pack_per_Year", "Income_1000",
+                  "Number_Teeth_after_Extraction", "RT_Dose", "D20")
+
+# (Optional) label mapping
+label_mapping <- list(
+  "Insurance_Type" = c("0" = "No Insurance", "1" = "Private", "2" = "Public"),
+  "Node" = c("0" = "N0", "1" = "N1", "2" = "N2", "3" = "N3"),
+  "Periodontal_Grading" = c("0" = "0", "1" = "I", "2" = "II", "3" = "III", "4" = "IV"),
+  "Disease_Site_Merged_2" = c("0" = "Others", "1" = "Oropharynx", "2" = "Oral Cavity")
+)
+
+map_labels <- function(df, label_mapping) {
+  df_mapped <- df
+  for (feature in names(label_mapping)) {
+    if (feature %in% colnames(df)) {
+      levs <- names(label_mapping[[feature]])  
+      labs <- unname(label_mapping[[feature]]) 
+      df_mapped[[feature]] <- factor(df_mapped[[feature]], levels = levs, labels = labs)
+    }
+  }
+  df_mapped
+}
+
+# -----------------------
+# UI
+# -----------------------
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  
+  titlePanel("Fine-Gray Model Prediction & SHAP Explanation (Precomputed)"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Enter Predictor Values"),
+      selectInput("Insurance_Type", "Insurance Type",
+                  choices = list("No Insurance" = "0", 
+                                 "Private"      = "1", 
+                                 "Public"       = "2"),
+                  selected = "0"),
+      selectInput("Node", "Node Status",
+                  choices = list("N0" = "0","N1" = "1","N2" = "2","N3" = "3"),
+                  selected = "2"),
+      selectInput("Periodontal_Grading", "Periodontal Grading",
+                  choices = list("0"="0","I"="1","II"="2","III"="3","IV"="4"),
+                  selected = "3"),
+      selectInput("Disease_Site_Merged_2", "Tumor Site",
+                  choices = list("Others"="0","Oropharynx"="1","Oral Cavity"="2"),
+                  selected = "2"),
+      numericInput("Age", "Age", value = 60, min = 0, max = 120),
+      numericInput("Smoking_Pack_per_Year", "Smoking Pack-Year", value = 50, min = 0, max = 200),
+      numericInput("Income_1000", "Income (in $1000)", value = 50, min = 0, max = 500),
+      numericInput("Number_Teeth_after_Extraction", "Number of Teeth After Extraction", 
+                   value = 20, min = 0, max = 32),
+      numericInput("RT_Dose", "RT Dose (Gy)", value = 66, min = 0, max = 80),
+      numericInput("D20", "D20 (Gy)", value = 55, min = 0, max = 100),
+      textInput("time_points_interest", 
+                "Time Points (comma-separated)", 
+                value = "60"),
+      
+      # --- NEW: Toggle for reference curve
+      checkboxInput("showReference", "Show Reference (Average CIF)?", value = FALSE),
+      
+      actionButton("predictBtn", "Predict & Explain"),
+      br(),
+      helpText("Click the button to generate CIF curve, predictions, and SHAP force plot.")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Results",
+                 h4("CIF Curve"),
+                 # Use plotlyOutput for interactive CIF
+                 plotlyOutput("plotCIF"),
+                 br(),
+                 h4("CIF Values at Requested Time Points"),
+                 tableOutput("cifValues"),
+                 br(),
+                 h4("SHAP Force Plot (Approx.)"),
+                 plotOutput("forcePlot", height = "300px")
+        )
+      )
+    )
+  )
+)
+
+# -----------------------
+# SERVER
+# -----------------------
+server <- function(input, output, session) {
+  
+  # Create a 1-row DF from user inputs
+  newdata_reactive <- reactive({
+    data.frame(
+      Insurance_Type = factor(input$Insurance_Type, levels = c("0", "1", "2")),
+      Node           = factor(input$Node, levels = c("0", "1", "2", "3")),
+      Periodontal_Grading = factor(input$Periodontal_Grading, 
+                                   levels = c("0", "1", "2", "3", "4")),
+      Disease_Site_Merged_2 = factor(input$Disease_Site_Merged_2, 
+                                     levels = c("0", "1", "2")),
+      Age = as.numeric(input$Age),
+      Smoking_Pack_per_Year = as.numeric(input$Smoking_Pack_per_Year),
+      Income_1000 = as.numeric(input$Income_1000),
+      Number_Teeth_after_Extraction = as.numeric(input$Number_Teeth_after_Extraction),
+      RT_Dose = as.numeric(input$RT_Dose),
+      D20 = as.numeric(input$D20)
+    )
+  })
+  
+  observeEvent(input$predictBtn, {
+    # 1. Predict & Plot CIF
+    one_indiv <- newdata_reactive()
+    time_grid <- seq(0, 114, by = 1)
+    indiv_cif <- predictRisk(final_model, newdata = one_indiv, times = time_grid, cause = 1)
+    cif_values <- as.numeric(indiv_cif[1, ])
+    
+    output$plotCIF <- renderPlotly({
+      # Build the individual's data frame
+      df_plot <- data.frame(
+        Time = time_grid,
+        CIF  = round(cif_values, 3)
+      )
+      
+      # Base ggplot with individual's curve
+      p <- ggplot(df_plot, aes(x = Time, y = CIF)) +
+        geom_line(color = "blue") +
+        geom_point(aes(text = paste0("Time: ", Time, "\nCIF: ", sprintf('%.3f', CIF))),
+                   color = "blue", size = 1) +
+        theme_minimal() +
+        labs(title = "", x = "Time (months)", y = "CIF")
+      
+      # --- NEW: If user has checked "showReference", overlay the mean CIF
+      if (input$showReference) {
+        p <- p +
+          geom_line(
+            data = mean_cif_data,
+            aes(x = Time, y = MeanCIF),
+            color = "red", linetype = "dashed"
+          ) +
+          geom_point(
+            data = mean_cif_data,
+            aes(x = Time, y = MeanCIF,
+                text = paste0("Time: ", Time, "\nAvg CIF: ", sprintf('%.3f', MeanCIF))),
+            color = "red", size = 1
+          )
+      }
+      
+      ggplotly(p, tooltip = "text")
+    })
+    
+    # 2. Show CIF at user-requested times
+    user_times_vec <- as.numeric(trimws(strsplit(input$time_points_interest, ",")[[1]]))
+    user_times_vec <- user_times_vec[!is.na(user_times_vec)]
+    if (length(user_times_vec) == 0) user_times_vec <- c(60, 114)
+    indiv_cif_interest <- predictRisk(final_model, newdata = one_indiv, 
+                                      times = user_times_vec, cause = 1)
+    
+    output$cifValues <- renderTable({
+      data.frame(
+        Time = user_times_vec,
+        CIF  = sprintf("%.3f", as.numeric(indiv_cif_interest))
+      )
+    }, digits = 0, align = 'c')
+    
+    # 3. Approximate SHAP for the largest time in user_times_vec
+    shap_time_point <- max(user_times_vec, na.rm = TRUE)
+    valid_times <- c(36, 60, 114)
+    if (!shap_time_point %in% valid_times) {
+      # pick the closest of c(36,60,114)
+      shap_time_point <- valid_times[which.min(abs(valid_times - shap_time_point))]
+    }
+    
+    # 4. Gower distance
+    k_val <- 3
+    dist_vector <- compute_gower_distances(one_indiv, final_grid_data[feature_cols])
+    neighbor_idx <- order(dist_vector)[1:k_val]
+    neighbor_dist <- dist_vector[neighbor_idx]
+    inv_dist <- 1 / (neighbor_dist + 1e-8)
+    wts <- inv_dist / sum(inv_dist)
+    
+    # 5. Retrieve the shap columns for shap_time_point, e.g. "_t60"
+    shap_suffix <- paste0("_t", shap_time_point)
+    shap_cols <- grep(shap_suffix, names(final_grid_data), value = TRUE)
+    
+    shap_neighbors <- final_grid_data[neighbor_idx, shap_cols, drop = FALSE]
+    shap_neighbors_mat <- as.matrix(shap_neighbors)
+    shap_estimate_mat  <- t(shap_neighbors_mat) %*% wts
+    shap_estimate      <- as.numeric(shap_estimate_mat)
+    
+    shap_feature_names <- sub(shap_suffix, "", shap_cols)
+    shap_named <- setNames(shap_estimate, shap_feature_names)
+    
+    # 6. Compute a baseline
+    baseline_vals <- predictRisk(final_model, newdata = final_grid_data, 
+                                 times = shap_time_point, cause = 1)
+    baseline_value <- mean(baseline_vals, na.rm = TRUE)
+    
+    # 7. Build a shapviz object (one row)
+    one_indiv_labeled <- map_labels(one_indiv, label_mapping) 
+    shap_df <- as.data.frame(t(shap_named)) 
+    colnames(shap_df) <- shap_feature_names
+    
+    sv_obj <- shapviz(
+      object   = as.matrix(shap_df), 
+      X        = one_indiv_labeled, 
+      baseline = 0
+    )
+    
+    # 8. Force plot
+    output$forcePlot <- renderPlot({
+      sv_force(sv_obj, row_id = 1, max_display = 7) +
+        labs(title = paste("SHAP Force Plot at Time =", shap_time_point)) +
+        theme(aspect.ratio = 0.25, 
+              plot.title = element_text(hjust = 0.5))
+    })
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
